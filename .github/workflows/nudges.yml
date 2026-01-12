@@ -27,7 +27,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests neo4j thefuzz python-levenshtein python-dotenv
+          pip install -r requirements.txt
 
       # ---------------------------------------------------------
       # TASK 1: SYNC (Every 30 mins, at :15 and :45)
