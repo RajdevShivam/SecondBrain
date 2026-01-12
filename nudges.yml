@@ -1,0 +1,84 @@
+name: Automation Bot (Nudges & Sync)
+
+on:
+  schedule:
+    # 1. Sync Logic (Every 30 mins)
+    - cron: '*/30 * * * *'
+    
+    # 2. Daily Nudge (08:00 AM IST = 02:30 UTC)
+    - cron: '30 2 * * *'
+
+    # 3. Weekly Review (Sunday 07:00 PM IST = 13:30 UTC)
+    - cron: '30 13 * * 0'
+    
+  workflow_dispatch: # Allows manual trigger button
+
+jobs:
+  run-bots:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install requests neo4j thefuzz python-levenshtein python-dotenv
+
+      # ---------------------------------------------------------
+      # TASK 1: SYNC (Every 30 mins)
+      # ---------------------------------------------------------
+      - name: Run Master Sync
+        if: github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NEO4J_URI: ${{ secrets.NEO4J_URI }}
+          NEO4J_USER: ${{ secrets.NEO4J_USER }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+          CAPTURE_INBOX_DB_ID: ${{ secrets.CAPTURE_INBOX_DB_ID }}
+          IDEAS_DB_ID: ${{ secrets.IDEAS_DB_ID }}
+          KNOWLEDGE_BASE_DB_ID: ${{ secrets.KNOWLEDGE_BASE_DB_ID }}
+          PEOPLE_DB_ID: ${{ secrets.PEOPLE_DB_ID }}
+          ADMIN_DB_ID: ${{ secrets.ADMIN_DB_ID }}
+        run: python master_sync.py
+
+      # ---------------------------------------------------------
+      # TASK 2: DAILY NUDGE (08:00 AM IST)
+      # ---------------------------------------------------------
+      - name: Run Daily Nudge
+        if: github.event.schedule == '30 2 * * *' || github.event_name == 'workflow_dispatch'
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ADMIN_DB_ID: ${{ secrets.ADMIN_DB_ID }}
+          IDEAS_DB_ID: ${{ secrets.IDEAS_DB_ID }}
+          PEOPLE_DB_ID: ${{ secrets.PEOPLE_DB_ID }}
+          CAPTURE_INBOX_DB_ID: ${{ secrets.CAPTURE_INBOX_DB_ID }}
+        run: python daily_nudge.py
+
+      # ---------------------------------------------------------
+      # TASK 3: WEEKLY REVIEW (Sunday 07:00 PM IST)
+      # ---------------------------------------------------------
+      - name: Run Weekly Review
+        if: github.event.schedule == '30 13 * * 0' || github.event_name == 'workflow_dispatch'
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NEO4J_URI: ${{ secrets.NEO4J_URI }}
+          NEO4J_USER: ${{ secrets.NEO4J_USER }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ADMIN_DB_ID: ${{ secrets.ADMIN_DB_ID }}
+          IDEAS_DB_ID: ${{ secrets.IDEAS_DB_ID }}
+          KNOWLEDGE_BASE_DB_ID: ${{ secrets.KNOWLEDGE_BASE_DB_ID }}
+          PEOPLE_DB_ID: ${{ secrets.PEOPLE_DB_ID }}
+          CAPTURE_INBOX_DB_ID: ${{ secrets.CAPTURE_INBOX_DB_ID }}
+        run: python weekly_review.py

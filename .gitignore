@@ -1,0 +1,20 @@
+# 1. SECRETS (Never push these!)
+.env
+secrets.json
+token.json
+
+# 2. Python System Files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 3. Environment & OS
+venv/
+env/
+.DS_Store
+Thumbs.db
+
+# 4. Logs (Optional)
+*.log
+
+*__pycache__*
