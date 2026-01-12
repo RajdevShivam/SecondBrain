@@ -107,32 +107,42 @@ class NotionClient:
         database_id: str,
         filter_obj: Optional[Dict] = None,
         sorts: Optional[List[Dict]] = None,
-        page_size: int = 100
-    ) -> List[Dict]:
+        page_size: int = 100,
+        raw_response: bool = False
+    ):
         """
         Query a Notion database.
 
         Args:
             database_id: The database UUID
-            filter_obj: Optional filter object
+            filter_obj: Optional filter object (or full payload dict)
             sorts: Optional sort specifications
             page_size: Number of results per page
+            raw_response: If True, return full API response (for pagination)
 
         Returns:
-            List of page objects
+            List of page objects, or full response dict if raw_response=True
         """
         if not database_id:
             logger.error("Database ID is required")
-            return []
+            return {} if raw_response else []
 
-        payload: Dict[str, Any] = {"page_size": min(page_size, 100)}
-        if filter_obj:
-            payload["filter"] = filter_obj
-        if sorts:
-            payload["sorts"] = sorts
+        # Allow passing full payload directly via filter_obj
+        if filter_obj and ("page_size" in filter_obj or "start_cursor" in filter_obj):
+            payload = filter_obj
+        else:
+            payload: Dict[str, Any] = {"page_size": min(page_size, 100)}
+            if filter_obj:
+                payload["filter"] = filter_obj
+            if sorts:
+                payload["sorts"] = sorts
 
         try:
             result = self._request("POST", f"/databases/{database_id}/query", payload)
+
+            if raw_response:
+                return result
+
             pages = result.get("results", [])
             logger.info(
                 f"Queried database",
@@ -144,7 +154,7 @@ class NotionClient:
                 f"Failed to query database",
                 extra={"database_id": database_id[:8], "error": str(e)}
             )
-            return []
+            return {} if raw_response else []
 
     def fetch_pages_to_sync(self, database_id: str) -> List[Dict]:
         """

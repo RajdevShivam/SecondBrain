@@ -1,412 +1,274 @@
 #!/usr/bin/env python3
 """
-Master Notion-to-Neo4j Sync Engine (Robust & Normalized)
-- Auto-cleans Database IDs (works with URLs or IDs)
-- Syncs INBOX, IDEAS, and KNOWLEDGE BASE
-- Handles Updates via "Wipe & Replace"
+Master Notion-to-Neo4j Sync Engine
+
+Syncs content from Notion databases to Neo4j knowledge graph:
+- INBOX: Classifies and routes to destination DBs
+- IDEAS/KNOWLEDGE_BASE: Extracts concepts and syncs to graph
+- Uses AI for classification and triplet extraction
 """
 
-import requests
 import json
 import time
-import os
-import re
+import requests
 from datetime import datetime
-from dotenv import load_dotenv
-from neo4j import GraphDatabase
-from thefuzz import process, fuzz
 
-load_dotenv()
+# Import from secondbrain package
+from secondbrain.config import settings
+from secondbrain.logger import get_logger
+from secondbrain.dictionaries import (
+    UNAMBIGUOUS_SYNONYMS,
+    AMBIGUOUS_TERMS,
+    CONTEXT_HINTS,
+    preprocess_unambiguous,
+    build_disambiguation_hints,
+    get_canonical_map,
+)
+from secondbrain.neo4j_client import Neo4jClient, sanitize_relation
+from secondbrain.notion_client import NotionClient
+from secondbrain.sync_state import SyncStateManager
 
-# ==============================================================================
-# CONFIGURATION & ID CLEANER
-# ==============================================================================
+# Initialize logger
+logger = get_logger(__name__)
 
-def clean_notion_id(dirty_id):
-    """Extracts 32-char UUID from URL or messy string"""
-    if not dirty_id: return None
-    clean = re.sub(r'[\[\]\(\)]', '', dirty_id)
-    match = re.search(r'([a-f0-9]{32})', clean)
-    return match.group(1) if match else clean.strip()
+# Initialize clients
+notion_client = NotionClient()
+neo4j_client = Neo4jClient()
+sync_manager = SyncStateManager(neo4j_client)
 
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-GEMINI_MODEL = "gemini-2.0-flash-lite-preview-02-05"
-
-# Clean IDs automatically
-DB_CONFIG = {
-    "INBOX": {"id": clean_notion_id(os.getenv("CAPTURE_INBOX_DB_ID")), "type": "Inbox"},
-    "IDEAS": {"id": clean_notion_id(os.getenv("IDEAS_DB_ID")), "type": "Idea"},
-    "KNOWLEDGE_BASE": {"id": clean_notion_id(os.getenv("KNOWLEDGE_BASE_DB_ID")), "type": "Knowledge"},
-    "PEOPLE": {"id": clean_notion_id(os.getenv("PEOPLE_DB_ID")), "type": "Person"},
-    "ADMIN": {"id": clean_notion_id(os.getenv("ADMIN_DB_ID")), "type": "Task"},
-}
-
-# ==============================================================================
-# NORMALIZATION DICTIONARIES
-# ==============================================================================
-
-# Words to ignore during concept extraction
-STOPWORDS = {
-    "AND", "THE", "FOR", "BUT", "NOT", "WITH", "THAT", "THIS", "FROM",
-    "HAVE", "ARE", "WAS", "ALL", "ONE", "HAS", "CAN", "OUT", "INTO",
-    "NOW", "NEW", "BIG", "GET", "USE", "HOW", "WHO", "WHY", "YES"
-}
-
-# Tier 1: Unambiguous abbreviations -> Full names (deterministic O(1) lookup)
-UNAMBIGUOUS_SYNONYMS = {
-    # Crypto
-    "BTC": "Bitcoin", "ETH": "Ethereum", "DOGE": "Dogecoin",
-    # Stocks
-    "AAPL": "Apple Inc", "GOOGL": "Alphabet Inc", "MSFT": "Microsoft",
-    "TCS": "Tata Consultancy Services", "INFY": "Infosys",
-    # Indices
-    "NIFTY": "Nifty 50", "SENSEX": "BSE Sensex", "SPX": "S&P 500",
-    # Currencies
-    "USD": "US Dollar", "INR": "Indian Rupee",
-    # Finance Models
-    "GARCH": "Generalized Autoregressive Conditional Heteroskedasticity",
-    "ARIMA": "Autoregressive Integrated Moving Average",
-    "CAPM": "Capital Asset Pricing Model",
-    "EMH": "Efficient Market Hypothesis",
-    # Finance Metrics
-    "EBITDA": "Earnings Before Interest Taxes Depreciation Amortization",
-    "HFT": "High Frequency Trading",
-    "CAGR": "Compound Annual Growth Rate",
-    "ROE": "Return On Equity",
-    "ROA": "Return On Assets",
-    "CPI": "Consumer Price Index",
-    "GDP": "Gross Domestic Product",
-    # Institutions
-    "FED": "Federal Reserve",
-    "RBI": "Reserve Bank Of India",
-    # AI/ML
-    "NLP": "Natural Language Processing",
-    "LLM": "Large Language Model",
-    "LSTM": "Long Short-Term Memory",
-    "CNN": "Convolutional Neural Network",
-    "RNN": "Recurrent Neural Network",
-    "GPT": "Generative Pre-trained Transformer",
-    "RAG": "Retrieval Augmented Generation",
-}
-
-# Tier 2: Ambiguous abbreviations (need context to resolve)
-AMBIGUOUS_TERMS = {
-    "PE": ["Price To Earnings", "Private Equity"],
-    "VAR": ["Vector Autoregression", "Value At Risk"],
-    "ML": ["Machine Learning", "Maximum Likelihood"],
-    "IV": ["Implied Volatility", "Independent Variable"],
-    "ATM": ["At The Money", "Automated Teller Machine"],
-    "IR": ["Information Ratio", "Interest Rate"],
-    "ES": ["Expected Shortfall", "E-mini S&P"],
-    "MV": ["Mean-Variance", "Market Value"],
-    "BL": ["Black-Litterman", "Baseline"],
-}
-
-# Tier 3: Context hints for disambiguation
-CONTEXT_HINTS = {
-    "Price To Earnings": ["ratio", "multiple", "valuation", "earnings"],
-    "Private Equity": ["fund", "acquisition", "buyout", "capital"],
-    "Vector Autoregression": ["model", "econometric", "lag", "time series"],
-    "Value At Risk": ["risk", "loss", "confidence", "percentile"],
-    "Machine Learning": ["algorithm", "training", "prediction", "model", "neural"],
-    "Maximum Likelihood": ["estimation", "statistical", "parameter"],
-    "At The Money": ["option", "strike", "call", "put"],
-    "Automated Teller Machine": ["bank", "cash", "withdraw"],
-    "Implied Volatility": ["option", "vega", "skew"],
-    "Independent Variable": ["regression", "predictor", "feature"],
-}
-
-# ==============================================================================
-# HELPER FUNCTIONS
-# ==============================================================================
-
-def get_notion_headers():
-    return {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
-
-def preprocess_unambiguous(text):
-    expanded = text
-    keys_sorted = sorted(UNAMBIGUOUS_SYNONYMS.keys(), key=len, reverse=True)
-    pattern_str = r'\b(' + '|'.join(map(re.escape, keys_sorted)) + r')\b'
-    for abbr in set(re.findall(pattern_str, text)):
-        full = UNAMBIGUOUS_SYNONYMS[abbr]
-        expanded = re.sub(r'\b' + re.escape(abbr) + r'\b', f"{full} ({abbr})", expanded, count=1)
-    return expanded
-
-def build_disambiguation_hints(text):
-    detected = []
-    for abbr, meanings in AMBIGUOUS_TERMS.items():
-        if re.search(r'\b' + re.escape(abbr) + r'\b', text):
-            hint = f"- '{abbr}' could be: {', '.join(meanings)}"
-            for m in meanings:
-                if m in CONTEXT_HINTS:
-                    hint += f"\n  -> Use '{m}' if you see: {', '.join(CONTEXT_HINTS[m])}"
-            detected.append(hint)
-    return "\n".join(detected) if detected else ""
-
-def get_canonical_map_from_dictionaries():
-    canonical_map = {}
-    for k, v in UNAMBIGUOUS_SYNONYMS.items():
-        canonical_map[k.upper()] = v
-        if v.upper() not in canonical_map: canonical_map[v.upper()] = v
-    for abbr, meanings in AMBIGUOUS_TERMS.items():
-        for meaning in meanings:
-            if meaning.upper() not in canonical_map:
-                canonical_map[meaning.upper()] = meaning
-    return canonical_map
-
-def fetch_fuzzy_matches_from_neo4j(names):
-    matches = {}
-    if not NEO4J_URI: return {}
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        with driver.session() as session:
-            result = session.run("MATCH (c:Concept) RETURN c.name as name, c.aliases as aliases")
-            db_concepts = []
-            for record in result:
-                db_concepts.append(record["name"])
-                if record["aliases"]: db_concepts.extend(record["aliases"])
-            
-            if not db_concepts: return {}
-
-            for name in names:
-                best_match = process.extractOne(name, db_concepts, scorer=fuzz.token_sort_ratio)
-                if best_match and best_match[1] >= 88:
-                    res = session.run("""
-                        MATCH (c:Concept) WHERE c.name = $val OR $val IN c.aliases 
-                        RETURN c.name as canonical LIMIT 1
-                    """, val=best_match[0])
-                    rec = res.single()
-                    if rec: matches[name] = rec["canonical"]
-    except Exception: pass
-    finally: driver.close()
-    return matches
 
 def clean_json_string(text):
+    """Clean JSON response from AI (remove markdown code blocks)."""
     clean = text.strip()
-    if clean.startswith("```json"): clean = clean[7:]
-    elif clean.startswith("```"): clean = clean[3:]
-    if clean.endswith("```"): clean = clean[:-3]
+    if clean.startswith("```json"):
+        clean = clean[7:]
+    elif clean.startswith("```"):
+        clean = clean[3:]
+    if clean.endswith("```"):
+        clean = clean[:-3]
     return clean.strip()
 
-# ==============================================================================
+
+def gemini_request_with_retry(url, payload, max_retries=3, base_delay=2.0):
+    """
+    Make a Gemini API request with exponential backoff retry.
+
+    Args:
+        url: Gemini API endpoint URL
+        payload: Request JSON payload
+        max_retries: Maximum retry attempts (default 3)
+        base_delay: Base delay in seconds (default 2.0)
+
+    Returns:
+        Response JSON or None on failure
+    """
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=settings.gemini_timeout
+            )
+
+            # Success
+            if response.status_code == 200:
+                return response.json()
+
+            # Rate limited - retry with backoff
+            if response.status_code == 429:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Rate limited (429), retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"Rate limited after {max_retries} retries")
+                    return None
+
+            # Other error - don't retry
+            logger.warning(f"Gemini API error: {response.status_code}")
+            return None
+
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Timeout, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            else:
+                logger.error(f"Timeout after {max_retries} retries")
+                return None
+
+        except requests.exceptions.SSLError:
+            logger.error("SSL certificate verification failed")
+            return None
+
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Network error, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            else:
+                logger.error(f"Network error after {max_retries} retries: {e}")
+                return None
+
+    return None
+
+
+def fetch_fuzzy_matches_from_neo4j(names):
+    """Find fuzzy matches for concept names in Neo4j."""
+    return neo4j_client.fuzzy_match_concepts(
+        names,
+        threshold=settings.fuzzy_match_threshold
+    )
+
+
+def get_canonical_map_from_dictionaries():
+    """Get canonical name mapping from dictionaries."""
+    return get_canonical_map()
+
+
+# =============================================================================
 # NOTION IO
-# ==============================================================================
+# =============================================================================
 
 def fetch_pages_to_sync(db_id):
-    """Fetch 'New' or 'Update Graph' items"""
-    
-    # 1. CLEAN THE ID (Just in case)
+    """Fetch 'New' or 'Update Graph' items."""
     if not db_id:
-        print(f"  ❌ Error: Database ID is missing.")
+        logger.error("Database ID is missing")
         return []
-    
-    clean_id = db_id.strip()
-    
-    # 2. CONSTRUCT THE URL (Clean f-string, no brackets)
-    url = f"https://api.notion.com/v1/databases/{clean_id}/query"
-    
-    # Debug print (Optional: helps you see exactly what URL is being used)
-    # print(f"  🔍 Debug URL: {url}") 
+    return notion_client.fetch_pages_to_sync(db_id)
 
-    payload = {
-        "filter": {
-            "or": [
-                {"property": "Processing Status", "select": {"equals": "New"}},
-                {"property": "Processing Status", "select": {"equals": "Update Graph"}},
-                {"property": "Processing Status", "select": {"is_empty": True}}
-            ]
-        },
-        "page_size": 100
-    }
-    
-    try:
-        response = requests.post(url, headers=get_notion_headers(), json=payload)
-        response.raise_for_status()
-        return response.json().get("results", [])
-    except Exception as e:
-        print(f"  ❌ Error fetching from DB {clean_id}: {e}")
-        return []
 
 def extract_page_content(page):
-    page_id = page["id"]
-    props = page.get("properties", {})
-    
-    title = "Untitled"
-    title_prop = props.get("Title") or props.get("Name") or props.get("Task")
-    if title_prop and title_prop.get("title"):
-        title = "".join([t.get("plain_text", "") for t in title_prop["title"]])
-    
-    blocks_url = f"https://api.notion.com/v1/blocks/{page_id}/children"
-    try:
-        blocks_response = requests.get(blocks_url, headers=get_notion_headers())
-        blocks = blocks_response.json().get("results", [])
-    except: blocks = []
-    
-    block_texts = []
-    for block in blocks:
-        block_type = block.get("type")
-        if block_type in ["paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item", "numbered_list_item"]:
-            rich_text = block.get(block_type, {}).get("rich_text", [])
-            t = "".join([x.get("plain_text", "") for x in rich_text])
-            if t.strip(): block_texts.append(t)
-            
-    full_text = f"{title}\n\n" + "\n".join(block_texts)
-    
-    status_prop = props.get("Processing Status")
-    current_status = status_prop["select"].get("name", "") if status_prop and status_prop.get("select") else ""
-    
-    return {
-        "page_id": page_id,
-        "text": full_text.strip(),
-        "title": title,
-        "current_status": current_status,
-        "notion_url": page.get("url", "")
-    }
+    """Extract text content from a page."""
+    return notion_client.extract_page_content(page)
+
 
 def update_status(page_id, status):
-    url = f"https://api.notion.com/v1/pages/{page_id}"
-    payload = {"properties": {"Processing Status": {"select": {"name": status}}}}
-    try:
-        requests.patch(url, headers=get_notion_headers(), json=payload)
-    except Exception as e:
-        print(f"  ⚠️ Failed to update status: {e}")
+    """Update the Processing Status of a page."""
+    notion_client.update_status(page_id, status)
+
 
 def create_in_destination_db(category, text, extracted_data, subcategory=None):
+    """Create a page in the appropriate destination database."""
     target_db_id = None
     props = {}
     title = extracted_data.get("title", text[:100])
-    # Truncate text for Notion property limits (2000 char max)
+
+    # Truncate for Notion property limits
     safe_text = text[:1800] + "..." if len(text) > 1800 else text
-    # Truncate title too (Notion title limit is 2000 chars)
     safe_title = title[:200] if len(title) > 200 else title
 
     if category == "IDEAS":
-        target_db_id = DB_CONFIG["IDEAS"]["id"]
+        target_db_id = settings.ideas_db_id_clean
         props = {
             "Title": {"title": [{"text": {"content": safe_title}}]},
             "One-liner": {"rich_text": [{"text": {"content": safe_text}}]},
-            "Status": {"select": {"name": "Raw"}}
+            "Status": {"select": {"name": "Raw"}},
+            "Processing Status": {"select": {"name": "New"}}
         }
     elif category == "KNOWLEDGE_BASE":
-        target_db_id = DB_CONFIG["KNOWLEDGE_BASE"]["id"]
+        target_db_id = settings.knowledge_db_id
         props = {
             "Title": {"title": [{"text": {"content": safe_title}}]},
             "Key Insights": {"rich_text": [{"text": {"content": safe_text}}]},
-            "PARA Type": {"select": {"name": subcategory or "Resource"}}
+            "PARA Type": {"select": {"name": subcategory or "Resource"}},
+            "Processing Status": {"select": {"name": "New"}}
         }
     elif category == "PEOPLE":
-        target_db_id = DB_CONFIG["PEOPLE"]["id"]
+        target_db_id = settings.people_db_id_clean
         props = {
             "Name": {"title": [{"text": {"content": safe_title}}]},
             "Context": {"rich_text": [{"text": {"content": safe_text}}]}
         }
     elif category == "ADMIN":
-        target_db_id = DB_CONFIG["ADMIN"]["id"]
+        target_db_id = settings.admin_db_id_clean
         props = {
             "Task": {"title": [{"text": {"content": safe_title}}]},
             "Notes": {"rich_text": [{"text": {"content": safe_text}}]},
             "Status": {"select": {"name": "Not Started"}}
         }
-        # ADMIN tasks don't need graph sync, but we still create them
-        # Return special marker after creation
     else:
         return None
 
     if not target_db_id:
-        print(f"  [WARNING] No database configured for category: {category}")
+        logger.warning(f"No database configured for category: {category}")
         return None
 
-    # Set Processing Status for graph-synced databases (set to "New", will be updated to "Active" after sync)
-    if category in ["IDEAS", "KNOWLEDGE_BASE"]:
-        props["Processing Status"] = {"select": {"name": "New"}}
+    new_page_id = notion_client.create_page(target_db_id, props)
 
-    try:
-        response = requests.post(
-            "https://api.notion.com/v1/pages",
-            headers=get_notion_headers(),
-            json={"parent": {"database_id": target_db_id}, "properties": props}
-        )
-        response.raise_for_status()
-        new_page_id = response.json()["id"]
+    if new_page_id and category == "ADMIN":
+        return "ADMIN_CREATED"
 
-        # Return special marker for ADMIN (created but no graph sync needed)
-        if category == "ADMIN":
-            return "ADMIN_CREATED"
+    return new_page_id
 
-        return new_page_id
-    except requests.exceptions.HTTPError as e:
-        print(f"  [ERROR] Creating page failed: {e}")
-        print(f"  [DEBUG] Notion Response: {e.response.text}")
-        return None
-    except Exception as e:
-        print(f"  [ERROR] Creating destination page: {e}")
-        return None
 
-# ==============================================================================
+# =============================================================================
 # AI LOGIC
-# ==============================================================================
+# =============================================================================
 
 def classify_text(text):
+    """Classify text into a category using Gemini AI with retry logic."""
     clean_text = preprocess_unambiguous(text)
-    # Truncate to avoid huge prompts
-    if len(clean_text) > 3000:
-        clean_text = clean_text[:3000] + "..."
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    # Truncate to avoid huge prompts
+    if len(clean_text) > settings.text_truncation_limit:
+        clean_text = clean_text[:settings.text_truncation_limit] + "..."
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
+
     prompt = f"""
 Classify this capture into ONE category:
 TEXT: "{clean_text}"
 
 CATEGORIES:
-- PEOPLE: Notes about specific individuals, contacts, networking info, who someone is
-- ADMIN: Tasks, to-dos, reminders, action items, things to do
-- IDEAS: Raw ideas, concepts, thoughts, brainstorms, hypotheses
-- KNOWLEDGE_BASE: Study notes, research, facts, reference material, tutorials, how-tos
+- PEOPLE: Notes about specific individuals, contacts, networking info
+- ADMIN: Tasks, to-dos, reminders, action items
+- IDEAS: Raw ideas, concepts, thoughts, brainstorms
+- KNOWLEDGE_BASE: Study notes, research, facts, reference material
 - TRASH: Spam, meaningless, duplicates, or test content
 
 OUTPUT JSON: {{ "category": "...", "subcategory": "...", "confidence": 0.0, "extracted_data": {{"title": "..."}} }}
     """
+
     try:
-        response = requests.post(
+        response_json = gemini_request_with_retry(
             url,
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30  # Add timeout to prevent hanging
+            {"contents": [{"parts": [{"text": prompt}]}]},
+            max_retries=3,
+            base_delay=2.0
         )
-        if response.status_code != 200:
-            print(f"    [API Error] {response.status_code}: {response.text[:200]}")
+
+        if not response_json:
             return {"category": "REVIEW_NEEDED", "confidence": 0}
-        result = json.loads(clean_json_string(response.json()["candidates"][0]["content"]["parts"][0]["text"]))
+
+        result = json.loads(clean_json_string(
+            response_json["candidates"][0]["content"]["parts"][0]["text"]
+        ))
         return result
-    except requests.exceptions.SSLError as e:
-        print(f"    [SSL Error] Certificate verification failed. Try: pip install --upgrade certifi")
-        return {"category": "REVIEW_NEEDED", "confidence": 0}
-    except requests.exceptions.Timeout:
-        print(f"    [Timeout] Gemini API took too long")
-        return {"category": "REVIEW_NEEDED", "confidence": 0}
-    except requests.exceptions.RequestException as e:
-        print(f"    [Network Error] {e}")
-        return {"category": "REVIEW_NEEDED", "confidence": 0}
+
     except Exception as e:
-        print(f"    [Classification Error] {e}")
+        logger.error(f"Classification error: {e}")
         return {"category": "REVIEW_NEEDED", "confidence": 0}
+
 
 def extract_triplets(text):
+    """Extract concepts and relationships from text using Gemini AI with retry logic."""
     processed = preprocess_unambiguous(text)
-    # Truncate to avoid huge prompts
-    if len(processed) > 3000:
-        processed = processed[:3000] + "..."
+
+    if len(processed) > settings.text_truncation_limit:
+        processed = processed[:settings.text_truncation_limit] + "..."
 
     hints = build_disambiguation_hints(text)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
+
     prompt = f"""
 Analyze this text:
 "{processed}"
@@ -419,277 +281,266 @@ OUTPUT JSON:
   "domain": "Field"
 }}
 """
+
     try:
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}
-        }
-        response = requests.post(
+        response_json = gemini_request_with_retry(
             url,
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=30
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}
+            },
+            max_retries=3,
+            base_delay=2.0
         )
-        if response.status_code != 200:
-            print(f"    [Triplet API Error] {response.status_code}")
+
+        if not response_json:
             return None
-        return json.loads(clean_json_string(response.json()["candidates"][0]["content"]["parts"][0]["text"]))
-    except requests.exceptions.SSLError:
-        print(f"    [SSL Error] Try: pip install --upgrade certifi")
-        return None
+
+        return json.loads(clean_json_string(
+            response_json["candidates"][0]["content"]["parts"][0]["text"]
+        ))
+
     except Exception as e:
-        print(f"    [Triplet Extraction Error] {e}")
+        logger.error(f"Triplet extraction error: {e}")
         return None
 
-# ==============================================================================
-# NEO4J SYNC (WIPE & REPLACE)
-# ==============================================================================
+
+# =============================================================================
+# NEO4J SYNC
+# =============================================================================
 
 def normalize_extraction(extraction):
-    if not extraction or not extraction.get("concepts"): return extraction
-    
+    """Normalize concept names using dictionaries and fuzzy matching."""
+    if not extraction or not extraction.get("concepts"):
+        return extraction
+
     canonical_map = get_canonical_map_from_dictionaries()
     names = [c["name"] for c in extraction["concepts"]]
     unknowns = [n for n in names if n.upper() not in canonical_map]
-    
+
     if unknowns:
         db_matches = fetch_fuzzy_matches_from_neo4j(unknowns)
-        for orig, canon in db_matches.items(): canonical_map[orig.upper()] = canon
-    
+        for orig, canon in db_matches.items():
+            canonical_map[orig.upper()] = canon
+
     final_concepts = []
     for c in extraction["concepts"]:
         orig = c.get("name", "").strip()
         final = canonical_map.get(orig.upper(), orig)
-        
+
         existing = next((x for x in final_concepts if x["name"] == final), None)
         if existing:
             new_aliases = c.get("aliases", [])
-            if orig != final: new_aliases.append(orig)
+            if orig != final:
+                new_aliases.append(orig)
             existing["aliases"] = list(set(existing.get("aliases", []) + new_aliases))
         else:
             c["name"] = final
-            if "aliases" not in c: c["aliases"] = []
-            if orig != final: c["aliases"].append(orig)
+            if "aliases" not in c:
+                c["aliases"] = []
+            if orig != final:
+                c["aliases"].append(orig)
             final_concepts.append(c)
-    
+
     extraction["concepts"] = final_concepts
+
     for t in extraction.get("triplets", []):
-        s, o = t.get("subject", "").strip().upper(), t.get("object", "").strip().upper()
-        if s in canonical_map: t["subject"] = canonical_map[s]
-        if o in canonical_map: t["object"] = canonical_map[o]
-    
+        s = t.get("subject", "").strip().upper()
+        o = t.get("object", "").strip().upper()
+        if s in canonical_map:
+            t["subject"] = canonical_map[s]
+        if o in canonical_map:
+            t["object"] = canonical_map[o]
+
     return extraction
 
-def sanitize_relation(raw):
-    clean = raw.replace(" ", "_").replace("-", "_").upper()
-    clean = ''.join(c for c in clean if c.isalnum() or c == '_')
-    return clean if clean and clean[0].isalpha() else "RELATED_TO"
 
 def sync_page_to_neo4j(extraction, page_id):
+    """Sync extraction results to Neo4j graph."""
     extraction = normalize_extraction(extraction)
-    if not extraction or not extraction.get("concepts"): return False
-    
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        with driver.session() as session:
-            ts = datetime.now().isoformat()
-            
-            # 1. DELETE OLD LINKS owned by this page
-            print(f"    🧹 Wiping old graph connections for {page_id}...")
-            session.run("MATCH ()-[r {source_page: $pid}]->() DELETE r", pid=page_id)
-            
-            # 2. MERGE CONCEPTS (Nodes are shared, so we don't delete them, just merge)
-            concepts = extraction.get("concepts", [])
-            batch = [{
-                "name": c["name"], "type": c.get("type", "Concept"), 
-                "aliases": c.get("aliases", []), "domain": extraction.get("domain", "General")
-            } for c in concepts]
-            
-            if batch:
-                session.run("""
-                    UNWIND $batch AS item
-                    MERGE (c:Concept {name: item.name})
-                    ON CREATE SET c.type = item.type, c.domains = [item.domain], c.aliases = item.aliases, c.first_seen = datetime($ts)
-                    ON MATCH SET c.last_mentioned = datetime($ts), c.aliases = COALESCE(c.aliases, []) + [x IN item.aliases WHERE NOT x IN COALESCE(c.aliases, [])]
-                """, batch=batch, ts=ts)
-            
-            # 3. CREATE NEW LINKS (Stamped with page_id)
-            triplets = extraction.get("triplets", [])
-            for t in triplets:
-                sub, obj = t.get("subject"), t.get("object")
-                if sub and obj:
-                    rtype = sanitize_relation(t.get("relation"))
-                    session.run(f"""
-                        MATCH (a:Concept {{name: $sub}}), (b:Concept {{name: $obj}})
-                        MERGE (a)-[r:`{rtype}` {{source_page: $pid}}]->(b)
-                        ON CREATE SET r.first_linked = datetime($ts)
-                        SET r.confidence = $conf, r.context = $ctx, r.last_updated = datetime($ts)
-                    """, sub=sub, obj=obj, pid=page_id, conf=t.get("confidence", 0.8), ctx=t.get("context", "")[:200], ts=ts)
-            return True
-    except Exception as e:
-        print(f"    ❌ Neo4j Error: {e}")
+    if not extraction or not extraction.get("concepts"):
         return False
-    finally:
-        driver.close()
 
-# ==============================================================================
-# MAIN CONTROLLER
-# ==============================================================================
+    try:
+        # Use neo4j_client for all operations
+        success = neo4j_client.sync_page(extraction, page_id)
+
+        if success:
+            # Track sync state
+            concepts = [c["name"] for c in extraction.get("concepts", [])]
+            relations_count = len(extraction.get("triplets", []))
+            content_hash = sync_manager.compute_content_hash({
+                "page_id": page_id,
+                "text": str(extraction),
+                "title": ""
+            })
+            sync_manager.mark_synced(
+                page_id=page_id,
+                content_hash=content_hash,
+                concepts=concepts,
+                relations_count=relations_count,
+                source_db="GRAPH_SYNC"
+            )
+
+        return success
+
+    except Exception as e:
+        logger.error(f"Neo4j sync error: {e}", extra={"page_id": page_id[:8]})
+        return False
+
+
+# =============================================================================
+# MAIN PROCESSING
+# =============================================================================
 
 def process_inbox_item(page):
+    """Process an item from the Capture Inbox."""
     page_id = page['page_id']
     text = page['text']
-    print(f"  [INBOX] {page['title'][:50]}...")
+
+    logger.info(f"Processing inbox item: {page['title'][:50]}...")
 
     if len(text) < 10:
         update_status(page_id, "Processed")
-        print("    [SKIP] Text too short")
+        logger.info("Skipping - text too short")
         return
 
     # 1. Classify
     cl = classify_text(text)
     cat = cl.get("category", "REVIEW_NEEDED")
     confidence = cl.get("confidence", 0)
-    print(f"    [CLASSIFY] {cat} (confidence: {confidence})")
+
+    logger.info(f"Classified as {cat}", extra={"confidence": confidence})
 
     if cat == "TRASH":
         update_status(page_id, "Processed")
-        print("    [TRASH] Discarded")
+        logger.info("Discarded as trash")
         return
 
-    if cat == "REVIEW_NEEDED" or confidence < 0.6:
+    if cat == "REVIEW_NEEDED" or confidence < settings.low_confidence_threshold:
         update_status(page_id, "Reviewing")
-        print("    [REVIEW] Low confidence, needs manual review")
+        logger.info("Needs manual review - low confidence")
         return
 
     # 2. Move to Destination
-    new_page_id = create_in_destination_db(cat, text, cl.get("extracted_data", {}), cl.get("subcategory"))
+    new_page_id = create_in_destination_db(
+        cat, text,
+        cl.get("extracted_data", {}),
+        cl.get("subcategory")
+    )
 
     if new_page_id == "ADMIN_CREATED":
         update_status(page_id, "Processed")
-        print("    [OK] Admin task created (no graph sync)")
+        logger.info("Admin task created (no graph sync)")
         return
-    elif new_page_id == "PEOPLE_CREATED" or cat == "PEOPLE":
-        # PEOPLE items: create page but optionally sync to graph for relationships
-        if new_page_id and new_page_id not in ["ADMIN_CREATED"]:
-            print(f"    [OK] Person added to PEOPLE database")
-            # Optionally extract relationships for people too
+    elif cat == "PEOPLE":
+        if new_page_id:
+            logger.info("Person added to PEOPLE database")
             extraction = extract_triplets(text)
             if extraction and extraction.get("concepts"):
                 if sync_page_to_neo4j(extraction, new_page_id):
-                    print("    [OK] Person relationships synced to Graph")
+                    logger.info("Person relationships synced to graph")
         update_status(page_id, "Processed")
         return
     elif not new_page_id:
-        print(f"    [ERROR] Failed to create page in {cat}")
+        logger.error(f"Failed to create page in {cat}")
         update_status(page_id, "Reviewing")
         return
 
-    print(f"    [OK] Moved to {cat}")
+    logger.info(f"Moved to {cat}")
 
     # 3. Sync to Graph (IDEAS and KNOWLEDGE_BASE)
     if cat in ["IDEAS", "KNOWLEDGE_BASE"]:
         extraction = extract_triplets(text)
         if extraction and extraction.get("concepts"):
             if sync_page_to_neo4j(extraction, new_page_id):
-                print("    [OK] Synced to Graph")
-                # Update destination page status to "Active" after successful sync
+                logger.info("Synced to graph")
                 update_status(new_page_id, "Active")
             else:
-                print("    [WARNING] Graph sync failed")
+                logger.warning("Graph sync failed")
         else:
-            print("    [INFO] No concepts extracted")
-            # Still mark as Active even if no concepts (nothing to sync)
+            logger.info("No concepts extracted")
             update_status(new_page_id, "Active")
 
-    # Mark original INBOX item as Processed
     update_status(page_id, "Processed")
 
+
 def process_destination_item(page, db_type):
+    """Process an item from IDEAS or KNOWLEDGE_BASE for graph sync."""
     page_id = page['page_id']
     text = page['text']
-    print(f"  🔄 Updating {db_type}: {page['title']}")
-    
+
+    logger.info(f"Updating {db_type}: {page['title']}")
+
     extraction = extract_triplets(text)
     if extraction:
         if sync_page_to_neo4j(extraction, page_id):
-            print("    ✅ Graph Updated.")
+            logger.info("Graph updated")
             update_status(page_id, "Active")
         else:
-            print("    ⚠️ Sync Failed.")
+            logger.warning("Sync failed")
     else:
-        print("    ⚠️ No concepts found.")
+        logger.warning("No concepts found")
         update_status(page_id, "Active")
 
+
 def validate_config():
-    """Validate all required configuration is present"""
-    print("=" * 60)
-    print("CONFIG CHECK")
-    print("=" * 60)
+    """Validate all required configuration is present."""
+    logger.info("=" * 50)
+    logger.info("CONFIG CHECK")
+    logger.info("=" * 50)
 
-    errors = []
+    try:
+        settings.validate_notion()
+        settings.validate_gemini()
+        settings.validate_neo4j()
 
-    # Check API credentials
-    checks = [
-        ("NOTION_TOKEN", NOTION_TOKEN),
-        ("GEMINI_API_KEY", GEMINI_API_KEY),
-        ("NEO4J_URI", NEO4J_URI),
-        ("NEO4J_PASSWORD", NEO4J_PASSWORD),
-    ]
+        logger.info("All API credentials present")
 
-    for name, value in checks:
-        if value:
-            print(f"  [OK] {name}: {'*' * 8}...{value[-4:] if len(value) > 4 else '****'}")
-        else:
-            print(f"  [MISSING] {name}")
-            errors.append(name)
+        # Check database IDs
+        db_config = settings.db_config
+        for db_name, config in db_config.items():
+            if config["id"]:
+                logger.info(f"{db_name}: {config['id'][:8]}...")
+            else:
+                if db_name == "INBOX":
+                    raise ValueError(f"Missing critical: {db_name}_DB_ID")
+                logger.warning(f"Missing: {db_name}")
 
-    # Check Database IDs
-    print("\nDatabase IDs:")
-    for db_name, config in DB_CONFIG.items():
-        if config["id"]:
-            print(f"  [OK] {db_name}: {config['id'][:8]}...")
-        else:
-            print(f"  [MISSING] {db_name}")
-            if db_name == "INBOX":  # INBOX is critical
-                errors.append(f"{db_name}_DB_ID")
+        logger.info("Configuration valid")
+        return True
 
-    print("=" * 60)
-
-    if errors:
-        print(f"\n[ERROR] Missing critical config: {', '.join(errors)}")
-        print("Check your .env file and ensure all variables are set.")
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
         return False
 
-    print("[OK] All critical config present!\n")
-    return True
 
 def main():
-    print("="*60 + "\n MASTER SYNC ENGINE STARTED\n" + "="*60)
+    """Main entry point."""
+    logger.info("=" * 50)
+    logger.info("MASTER SYNC ENGINE STARTED")
+    logger.info("=" * 50)
 
-    # Validate config before proceeding
     if not validate_config():
         return
 
-    # Define which databases to scan and how to process them
-    # INBOX: Classify and route to destination DBs
-    # IDEAS/KNOWLEDGE_BASE: Sync to Neo4j on "New" or "Update Graph"
-    # PEOPLE/ADMIN: Skip (no graph sync needed)
+    # Databases to scan
     DATABASES_TO_SCAN = ["INBOX", "IDEAS", "KNOWLEDGE_BASE"]
+    db_config = settings.db_config
 
     for name in DATABASES_TO_SCAN:
-        config = DB_CONFIG.get(name)
+        config = db_config.get(name)
         if not config or not config["id"]:
             continue
 
-        print(f"\n>>> Scanning {name}...")
+        logger.info(f"Scanning {name}...")
         pages = fetch_pages_to_sync(config["id"])
 
         if not pages:
-            print("   No updates found.")
+            logger.info("No updates found")
             continue
 
-        print(f"   Found {len(pages)} items.")
+        logger.info(f"Found {len(pages)} items")
 
         for p in pages:
             content = extract_page_content(p)
@@ -697,15 +548,15 @@ def main():
                 if name == "INBOX":
                     process_inbox_item(content)
                 else:
-                    # Process destination items (IDEAS, KNOWLEDGE_BASE) for graph re-sync
                     process_destination_item(content, config["type"])
             except Exception as e:
-                print(f"   [ERROR] Critical Error processing item: {e}")
+                logger.error(f"Error processing item: {e}")
             time.sleep(1)
 
-    print("\n" + "="*60)
-    print(" SYNC COMPLETE")
-    print("="*60)
+    logger.info("=" * 50)
+    logger.info("SYNC COMPLETE")
+    logger.info("=" * 50)
+
 
 if __name__ == "__main__":
     main()
