@@ -5,14 +5,14 @@ A professional-grade personal knowledge management system that automates the cap
 ## Architecture Overview
 
 ```
-Telegram ──► Pipedream (real-time) ──► Notion DBs (5 databases)
-                                              │
-GitHub Actions (scheduled) ───────────────────┤
-  - master_sync.py (every 30 min)             │
-  - daily_nudge.py (8 AM IST)                 ├──► Neo4j Knowledge Graph
-  - weekly_review.py (Sun 7 PM IST)           │
-                                              │
-                                              ▼
+Telegram Bot ──► Pipedream (real-time) ──► Notion DBs (5 databases)
+                                                  │
+GitHub Actions (scheduled) ───────────────────────┤
+  - master_sync.py (:15, :45 every hour)          │
+  - daily_nudge.py (8:00 AM IST)                  ├──► Neo4j Knowledge Graph
+  - weekly_review.py (Sun 7:00 PM IST)            │
+                                                  │
+                                                  ▼
                                         Telegram Notifications
 ```
 
@@ -66,6 +66,11 @@ SecondBrain/
 │   ├── test_config.py
 │   ├── test_dictionaries.py
 │   └── test_sync_state.py
+├── scripts/                  # One-time utility scripts
+│   ├── reset_neo4j.py        # Wipe Neo4j database
+│   ├── force_resync.py       # Mark Notion pages for re-sync
+│   ├── neo4j_diagnostics.py  # Graph health diagnostics
+│   └── test_telegram.py      # Test Telegram integration
 ├── pipeddream/               # Pipedream standalone scripts
 ├── master_sync.py            # Main sync script
 ├── daily_nudge.py            # Daily briefing script
@@ -78,6 +83,14 @@ SecondBrain/
 ```
 
 ## Key Features
+
+### Exponential Backoff Retry Logic
+All API calls include automatic retry with exponential backoff:
+- **Gemini API**: 3 retries, 2s base delay (2s → 4s → 8s)
+  - Handles 429 rate limits, timeouts, network errors
+  - Weekly review uses 120s timeout for large prompts
+- **Notion API**: 3 retries, 1s base delay via `@retry_with_backoff` decorator
+- **Telegram API**: 2 retries, 1s base delay + HTML → plain text fallback
 
 ### Normalization System (3-tier)
 1. **Unambiguous** - Direct mappings (BTC → Bitcoin, GARCH → full name)
@@ -122,10 +135,13 @@ SecondBrain/
 ### Notion API
 - Version: 2022-06-28
 - Rate limits: Handled with MAX_WORKERS=2 for parallel requests
+- Retry logic: 3 retries with 1s base delay
 
 ### Google Gemini
 - Model: gemini-2.0-flash-lite-preview-02-05
 - Used for classification, triplet extraction, and summaries
+- Retry logic: 3 retries with 2s base delay (exponential backoff)
+- Default timeout: 30s (120s for weekly reviews)
 
 ### Neo4j AuraDB
 - Graph database for knowledge storage
@@ -134,14 +150,17 @@ SecondBrain/
 ### Telegram Bot API
 - HTML parse mode with Markdown fallback
 - Message splitting for long texts (4000 char limit)
+- Retry logic: 2 retries with 1s base delay
 
 ## Scheduled Jobs (GitHub Actions)
 
 | Schedule | Script | Purpose |
 |----------|--------|---------|
-| Every 30 min | master_sync.py | Sync Notion to Neo4j |
-| 8:00 AM IST | daily_nudge.py | Morning briefing |
-| Sun 7:00 PM IST | weekly_review.py | Weekly analysis |
+| :15 and :45 every hour | master_sync.py | Sync Notion to Neo4j |
+| 8:00 AM IST (02:30 UTC) | daily_nudge.py | Morning briefing |
+| Sun 7:00 PM IST (13:30 UTC) | weekly_review.py | Weekly analysis |
+
+**Note:** Master sync runs at :15 and :45 to avoid conflicts with other scheduled jobs.
 
 ## Common Tasks
 
@@ -153,6 +172,23 @@ python master_sync.py
 ### Run tests
 ```bash
 pytest tests/ -v
+```
+
+### Reset Neo4j and re-sync
+```bash
+# 1. Reset Neo4j database (DESTRUCTIVE!)
+python scripts/reset_neo4j.py --confirm
+
+# 2. Mark all Notion pages for re-sync
+python scripts/force_resync.py
+
+# 3. Run master sync
+python master_sync.py
+```
+
+### Check graph health
+```bash
+python scripts/neo4j_diagnostics.py
 ```
 
 ### Check for duplicates in graph
@@ -168,3 +204,23 @@ from secondbrain.graph_services import get_health_checker
 health = get_health_checker()
 report = health.get_health_report()
 ```
+
+## Troubleshooting
+
+### Gemini 429 Rate Limit Errors
+The system automatically retries with exponential backoff. If issues persist:
+- Increase `GEMINI_TIMEOUT` in `.env` to 60 or 120 seconds
+- Check logs for retry attempts: `Rate limited (429), retrying in X.Xs`
+
+### Items marked "Reviewing" status
+These are items where AI classification failed. To fix:
+1. Open Capture Inbox in Notion
+2. Filter by `Processing Status = "Reviewing"`
+3. For each item: read content, set `Category`, change status to `New`
+4. Next sync will pick them up automatically
+
+### Weekly review timeout
+If weekly review times out:
+- The code now uses 120s timeout (increased from 30s)
+- Retry logic will attempt 3 times with backoff
+- If still fails, fallback review with stats is sent
