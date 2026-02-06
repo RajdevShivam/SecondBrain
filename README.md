@@ -328,3 +328,7 @@ MIT License - see LICENSE file for details
 ---
 
 **Note:** This is a personal knowledge management system. Handle your data with care and never commit API keys or credentials to version control.
+
+---
+
+**P.S.** I have since switched to [OpenClaw](https://openclaw.ai) for my SecondBrain implementation. Check it out for an even more powerful knowledge management solution!
