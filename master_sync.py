@@ -6,6 +6,7 @@ Syncs content from Notion databases to Neo4j knowledge graph:
 - INBOX: Classifies and routes to destination DBs
 - IDEAS/KNOWLEDGE_BASE: Extracts concepts and syncs to graph
 - Uses AI for classification and triplet extraction
+- Reconciles drift: detects Active pages edited since last sync
 """
 
 import json
@@ -355,8 +356,14 @@ def normalize_extraction(extraction):
     return extraction
 
 
-def sync_page_to_neo4j(extraction, page_id):
-    """Sync extraction results to Neo4j graph."""
+def sync_page_to_neo4j(extraction, page_id, notion_last_edited=None):
+    """Sync extraction results to Neo4j graph.
+
+    Args:
+        extraction: Extraction dict with concepts, triplets, domain
+        page_id: Notion page ID
+        notion_last_edited: Notion's last_edited_time for drift detection
+    """
     extraction = normalize_extraction(extraction)
     if not extraction or not extraction.get("concepts"):
         return False
@@ -379,7 +386,8 @@ def sync_page_to_neo4j(extraction, page_id):
                 content_hash=content_hash,
                 concepts=concepts,
                 relations_count=relations_count,
-                source_db="GRAPH_SYNC"
+                source_db="GRAPH_SYNC",
+                notion_last_edited=notion_last_edited,
             )
 
         return success
@@ -387,6 +395,119 @@ def sync_page_to_neo4j(extraction, page_id):
     except Exception as e:
         logger.error(f"Neo4j sync error: {e}", extra={"page_id": page_id[:8]})
         return False
+
+
+# =============================================================================
+# RECONCILIATION & ORPHAN RECOVERY
+# =============================================================================
+
+def run_reconciler():
+    """
+    Run drift reconciliation for IDEAS and KNOWLEDGE_BASE databases.
+
+    Fetches all Active pages, compares their last_edited_time against
+    stored SyncState.notion_last_edited, and marks drifted pages as
+    "Update Graph" so the main loop picks them up.
+    """
+    db_config = settings.db_config
+    reconcile_dbs = ["IDEAS", "KNOWLEDGE_BASE"]
+    total_drifted = 0
+
+    for db_name in reconcile_dbs:
+        config = db_config.get(db_name)
+        if not config or not config["id"]:
+            continue
+
+        try:
+            active_pages = notion_client.fetch_all_active_pages(config["id"])
+            if not active_pages:
+                continue
+
+            drifted_ids = sync_manager.reconcile(active_pages)
+
+            for page_id in drifted_ids:
+                notion_client.update_status(page_id, "Update Graph")
+                logger.info(
+                    f"Marked drifted page for re-sync",
+                    extra={"page_id": page_id[:8], "db": db_name}
+                )
+
+            total_drifted += len(drifted_ids)
+
+        except Exception as e:
+            logger.error(
+                f"Reconciliation failed for {db_name}",
+                extra={"error": str(e)}
+            )
+
+    if total_drifted:
+        logger.info(f"Reconciliation complete: {total_drifted} pages marked for re-sync")
+
+
+def recover_orphans():
+    """
+    Recover inbox items stuck in 'routing' state for >1 hour.
+
+    For each orphan, attempts to sync the routed destination page
+    to Neo4j and marks the inbox item as Processed.
+    """
+    try:
+        orphans = sync_manager.get_orphaned_items()
+        if not orphans:
+            return
+
+        logger.info(f"Found {len(orphans)} orphaned items")
+
+        for orphan in orphans:
+            inbox_page_id = orphan.get("page_id")
+            dest_page_id = orphan.get("routed_to_page_id")
+            dest_db = orphan.get("routed_to_db")
+
+            if not dest_page_id:
+                logger.warning(
+                    f"Orphan has no destination page",
+                    extra={"inbox_page_id": inbox_page_id[:8] if inbox_page_id else "?"}
+                )
+                continue
+
+            try:
+                # Try to get the destination page and sync it
+                dest_page = notion_client.get_page(dest_page_id)
+                if dest_page:
+                    content = notion_client.extract_page_content(dest_page)
+                    extraction = extract_triplets(content["text"])
+                    if extraction and extraction.get("concepts"):
+                        sync_page_to_neo4j(
+                            extraction, dest_page_id,
+                            notion_last_edited=content.get("last_edited_time")
+                        )
+                    update_status(dest_page_id, "Active")
+
+                # Mark inbox item as processed
+                update_status(inbox_page_id, "Processed")
+                sync_manager.mark_synced(
+                    page_id=inbox_page_id,
+                    content_hash="orphan_recovered",
+                    concepts=[],
+                    relations_count=0,
+                    source_db="ORPHAN_RECOVERY",
+                    routed_to_page_id=dest_page_id,
+                    routed_to_db=dest_db
+                )
+
+                logger.info(
+                    f"Recovered orphan",
+                    extra={"inbox_page_id": inbox_page_id[:8], "dest_page_id": dest_page_id[:8]}
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"Failed to recover orphan",
+                    extra={"inbox_page_id": inbox_page_id[:8], "error": str(e)}
+                )
+
+    except Exception as e:
+        logger.error(f"Orphan recovery failed: {e}")
 
 
 # =============================================================================
@@ -469,12 +590,13 @@ def process_destination_item(page, db_type):
     """Process an item from IDEAS or KNOWLEDGE_BASE for graph sync."""
     page_id = page['page_id']
     text = page['text']
+    last_edited = page.get('last_edited_time')
 
     logger.info(f"Updating {db_type}: {page['title']}")
 
     extraction = extract_triplets(text)
     if extraction:
-        if sync_page_to_neo4j(extraction, page_id):
+        if sync_page_to_neo4j(extraction, page_id, notion_last_edited=last_edited):
             logger.info("Graph updated")
             update_status(page_id, "Active")
         else:
@@ -524,6 +646,14 @@ def main():
     if not validate_config():
         return
 
+    # --- Phase 0: Reconcile drift & recover orphans ---
+    logger.info("Running drift reconciliation...")
+    run_reconciler()
+
+    logger.info("Checking for orphaned items...")
+    recover_orphans()
+
+    # --- Phase 1: Main sync loop ---
     # Databases to scan
     DATABASES_TO_SCAN = ["INBOX", "IDEAS", "KNOWLEDGE_BASE"]
     db_config = settings.db_config
