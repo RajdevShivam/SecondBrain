@@ -179,7 +179,8 @@ class Neo4jClient:
     def merge_concepts(
         self,
         concepts: List[Dict],
-        domain: str = "General"
+        domain: str = "General",
+        notion_page_id: Optional[str] = None
     ) -> bool:
         """
         Merge concepts into the graph (create if not exists, update if exists).
@@ -187,6 +188,7 @@ class Neo4jClient:
         Args:
             concepts: List of concept dicts with 'name', 'type', 'aliases'
             domain: Domain to associate with concepts
+            notion_page_id: Notion page ID to store on concept nodes
 
         Returns:
             True if successful
@@ -211,12 +213,14 @@ class Neo4jClient:
                         c.type = item.type,
                         c.domains = [item.domain],
                         c.aliases = item.aliases,
-                        c.first_seen = datetime($ts)
+                        c.first_seen = datetime($ts),
+                        c.notion_page_id = $notion_page_id
                     ON MATCH SET
                         c.last_mentioned = datetime($ts),
                         c.aliases = COALESCE(c.aliases, []) +
-                            [x IN item.aliases WHERE NOT x IN COALESCE(c.aliases, [])]
-                """, batch=batch, ts=ts)
+                            [x IN item.aliases WHERE NOT x IN COALESCE(c.aliases, [])],
+                        c.notion_page_id = COALESCE($notion_page_id, c.notion_page_id)
+                """, batch=batch, ts=ts, notion_page_id=notion_page_id)
 
             logger.info(
                 f"Merged concepts",
@@ -373,13 +377,59 @@ class Neo4jClient:
         # 2. Merge concepts
         concepts = extraction.get("concepts", [])
         domain = extraction.get("domain", "General")
-        self.merge_concepts(concepts, domain)
+        self.merge_concepts(concepts, domain, notion_page_id=page_id)
 
         # 3. Create new relationships
         triplets = extraction.get("triplets", [])
         self.sync_triplets(triplets, page_id)
 
         return True
+
+    def find_related_concepts(
+        self,
+        concept_names: List[str],
+        max_hops: int = 2,
+        limit: int = 10
+    ) -> List[Dict]:
+        """
+        Find existing KB concepts related to the given names via 1-2 hop traversal.
+
+        Args:
+            concept_names: List of concept names to find neighbors for
+            max_hops: Maximum traversal depth (1 or 2)
+            limit: Maximum results to return
+
+        Returns:
+            List of dicts with 'name', 'notion_page_id', 'hops', 'type'
+        """
+        if not concept_names:
+            return []
+
+        try:
+            # First try exact matches, then fuzzy
+            results = self.run_query(f"""
+                MATCH (c:Concept) WHERE c.name IN $names
+                MATCH (c)-[*1..{max_hops}]-(related:Concept)
+                WHERE NOT related.name IN $names
+                RETURN DISTINCT related.name as name,
+                       related.notion_page_id as notion_page_id,
+                       related.type as type,
+                       related.domains as domains
+                LIMIT $limit
+            """, {"names": concept_names, "limit": limit})
+
+            logger.info(
+                f"Found related concepts",
+                extra={"input_count": len(concept_names), "found": len(results)}
+            )
+            return results
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to find related concepts",
+                extra={"error": str(e)}
+            )
+            return []
 
     @staticmethod
     def _sanitize_relation(raw: str) -> str:
