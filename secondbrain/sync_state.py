@@ -5,6 +5,7 @@ Provides database consistency tracking between Notion and Neo4j:
 - Content hashing to detect changes
 - Sync state tracking in Neo4j
 - Orphan detection for incomplete syncs
+- Drift reconciliation between Notion and Neo4j
 """
 
 import hashlib
@@ -158,7 +159,8 @@ class SyncStateManager:
         relations_count: int,
         source_db: str = "UNKNOWN",
         routed_to_page_id: Optional[str] = None,
-        routed_to_db: Optional[str] = None
+        routed_to_db: Optional[str] = None,
+        notion_last_edited: Optional[str] = None
     ) -> bool:
         """
         Mark a page as successfully synced.
@@ -171,6 +173,7 @@ class SyncStateManager:
             source_db: Source database name
             routed_to_page_id: If routed, the destination page ID
             routed_to_db: If routed, the destination database name
+            notion_last_edited: Notion's last_edited_time for drift detection
 
         Returns:
             True if successful
@@ -183,6 +186,7 @@ class SyncStateManager:
                 ON CREATE SET
                     s.content_hash = $content_hash,
                     s.graph_last_synced = datetime($ts),
+                    s.notion_last_edited = $notion_last_edited,
                     s.sync_version = 1,
                     s.status = "synced",
                     s.concepts_extracted = $concepts,
@@ -193,6 +197,7 @@ class SyncStateManager:
                 ON MATCH SET
                     s.content_hash = $content_hash,
                     s.graph_last_synced = datetime($ts),
+                    s.notion_last_edited = $notion_last_edited,
                     s.sync_version = COALESCE(s.sync_version, 0) + 1,
                     s.status = "synced",
                     s.concepts_extracted = $concepts,
@@ -203,6 +208,7 @@ class SyncStateManager:
                 "page_id": page_id,
                 "content_hash": content_hash,
                 "ts": ts,
+                "notion_last_edited": notion_last_edited,
                 "concepts": concepts,
                 "relations_count": relations_count,
                 "source_db": source_db,
@@ -226,6 +232,63 @@ class SyncStateManager:
                 extra={"page_id": page_id[:8], "error": str(e)}
             )
             return False
+
+    def reconcile(self, active_pages: List[Dict]) -> List[str]:
+        """
+        Compare Notion edit times vs graph sync times to find drifted pages.
+
+        For each active page, checks if Notion's last_edited_time is newer
+        than the stored notion_last_edited on the SyncState node. If so,
+        the page has been edited since last sync and needs re-processing.
+
+        Args:
+            active_pages: List of dicts with 'page_id' and 'last_edited_time'
+                          (from NotionClient.fetch_all_active_pages)
+
+        Returns:
+            List of page_ids that need re-sync
+        """
+        drifted = []
+
+        for page in active_pages:
+            page_id = page.get("page_id", "")
+            notion_edited = page.get("last_edited_time", "")
+
+            if not page_id or not notion_edited:
+                continue
+
+            state = self.get_sync_state(page_id)
+
+            if state is None:
+                # Active in Notion but no SyncState — needs sync
+                drifted.append(page_id)
+                continue
+
+            stored_edited = state.get("notion_last_edited")
+
+            if not stored_edited:
+                # SyncState exists but never stored edit time — needs sync
+                drifted.append(page_id)
+                continue
+
+            # Compare ISO timestamps as strings (they sort correctly)
+            # Handle both str and neo4j DateTime objects
+            stored_str = str(stored_edited)
+            if notion_edited > stored_str:
+                drifted.append(page_id)
+
+        if drifted:
+            logger.info(
+                f"Reconciliation found drifted pages",
+                extra={"drifted_count": len(drifted), "total_active": len(active_pages)}
+            )
+        else:
+            logger.info(
+                f"Reconciliation complete, no drift detected",
+                extra={"total_active": len(active_pages)}
+            )
+
+        return drifted
 
     def mark_routing(
         self,
