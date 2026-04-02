@@ -175,6 +175,58 @@ class NotionClient:
         }
         return self.query_database(database_id, filter_obj)
 
+    def fetch_all_active_pages(self, database_id: str) -> List[Dict]:
+        """
+        Fetch all pages with status "Active" and their last_edited_time.
+
+        Used by the reconciler to detect drift between Notion and Neo4j.
+        Paginates through all results.
+
+        Args:
+            database_id: The database UUID
+
+        Returns:
+            List of dicts with 'page_id' and 'last_edited_time' (ISO string)
+        """
+        filter_obj = {
+            "property": "Processing Status",
+            "select": {"equals": "Active"}
+        }
+
+        active_pages = []
+        has_more = True
+        start_cursor = None
+
+        while has_more:
+            payload = {
+                "page_size": 100,
+                "filter": filter_obj,
+            }
+            if start_cursor:
+                payload["start_cursor"] = start_cursor
+
+            result = self.query_database(
+                database_id, payload, raw_response=True
+            )
+
+            if not result or not isinstance(result, dict):
+                break
+
+            for page in result.get("results", []):
+                active_pages.append({
+                    "page_id": page["id"],
+                    "last_edited_time": page.get("last_edited_time", ""),
+                })
+
+            has_more = result.get("has_more", False)
+            start_cursor = result.get("next_cursor")
+
+        logger.info(
+            f"Fetched active pages for reconciliation",
+            extra={"database_id": database_id[:8], "count": len(active_pages)}
+        )
+        return active_pages
+
     def fetch_pages_by_status(
         self,
         database_id: str,
@@ -248,7 +300,7 @@ class NotionClient:
             page: Page object from query
 
         Returns:
-            Dict with page_id, text, title, current_status, notion_url
+            Dict with page_id, text, title, current_status, notion_url, last_edited_time
         """
         page_id = page["id"]
         props = page.get("properties", {})
@@ -289,7 +341,8 @@ class NotionClient:
             "text": full_text.strip(),
             "title": title,
             "current_status": current_status,
-            "notion_url": page.get("url", "")
+            "notion_url": page.get("url", ""),
+            "last_edited_time": page.get("last_edited_time", ""),
         }
 
     def update_page_property(
@@ -343,7 +396,8 @@ class NotionClient:
     def create_page(
         self,
         database_id: str,
-        properties: Dict[str, Any]
+        properties: Dict[str, Any],
+        children: Optional[List[Dict]] = None
     ) -> Optional[str]:
         """
         Create a new page in a database.
@@ -351,19 +405,20 @@ class NotionClient:
         Args:
             database_id: Target database UUID
             properties: Page properties
+            children: Optional list of block objects for page body
 
         Returns:
             New page ID or None if failed
         """
         try:
-            result = self._request(
-                "POST",
-                "/pages",
-                {
-                    "parent": {"database_id": database_id},
-                    "properties": properties
-                }
-            )
+            body = {
+                "parent": {"database_id": database_id},
+                "properties": properties
+            }
+            if children:
+                body["children"] = children
+
+            result = self._request("POST", "/pages", body)
             page_id = result.get("id")
             logger.info(
                 f"Created page",
@@ -376,6 +431,50 @@ class NotionClient:
                 extra={"database_id": database_id[:8], "error": str(e)}
             )
             return None
+
+    def get_page(self, page_id: str) -> Optional[Dict]:
+        """
+        Retrieve a single page by ID.
+
+        Args:
+            page_id: The page UUID
+
+        Returns:
+            Page object or None
+        """
+        try:
+            return self._request("GET", f"/pages/{page_id}")
+        except Exception as e:
+            logger.warning(
+                f"Failed to get page",
+                extra={"page_id": page_id[:8], "error": str(e)}
+            )
+            return None
+
+    def append_blocks(self, page_id: str, children: List[Dict]) -> bool:
+        """
+        Append block children to a page.
+
+        Args:
+            page_id: The page UUID
+            children: List of block objects
+
+        Returns:
+            True if successful
+        """
+        try:
+            self._request(
+                "PATCH",
+                f"/blocks/{page_id}/children",
+                {"children": children}
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"Failed to append blocks",
+                extra={"page_id": page_id[:8], "error": str(e)}
+            )
+            return False
 
 
 # Helper functions for quick access (backwards compatibility)
